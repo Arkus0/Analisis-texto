@@ -1,0 +1,5 @@
+{
+  "name": "SoulScribe",
+  "description": "Extrae el 'alma' y el estilo de escritura de cualquier documento PDF para crear clones de texto mediante IA.",
+  "requestFramePermissions": []
+}
