@@ -1,0 +1,39 @@
+name: pec_killer
+description: "PEC Killer - Assignment pipeline for UOC students"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.8
+
+# DB choice: sqflite (SQLite)
+# Why sqflite over Isar/Hive/Drift:
+# - Most mature and battle-tested SQLite wrapper for Flutter
+# - No code generation step (unlike Drift/Isar) = faster iteration for MVP
+# - SQLite is the gold standard for offline-first mobile apps
+# - Simple API, excellent documentation, predictable behavior
+# - Isar is being sunset; Hive lacks relational queries we need for
+#   course->assignment->block relationships
+# - sqflite gives us JOIN capability for future queries if needed
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sqflite: ^2.4.2
+  path: ^1.9.1
+  provider: ^6.1.2
+  intl: ^0.20.2
+  pdf: ^3.11.3
+  printing: ^5.13.0
+  path_provider: ^2.1.5
+  share_plus: ^10.1.4
+  uuid: ^4.5.1
+  archive: ^4.0.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
