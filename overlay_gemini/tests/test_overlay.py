@@ -105,8 +105,16 @@ def test_window_fits_real_text_sizes(overlay, qapp):
     eight = "\n".join(f"- Punto {i}: explicación breve y al grano." for i in range(8))
     o.show_message("Dudas", eight)
     mid = o.last_fit()
+    # La pantalla virtual de los tests es pequeña (800×800) y las métricas de fuente
+    # cambian según el SO: puede que haya tenido que reducir algo la letra, pero cabe.
     assert not mid.truncated and short.height < mid.height <= max_h
-    assert mid.font_px == settings.overlay.font_px
+    assert mid.font_px >= round(settings.overlay.font_px * settings.overlay.min_font_ratio)
+
+    settings.overlay.max_height = 0.9  # con sitio de sobra, se mantiene la letra base
+    o.show_message("Dudas", eight)
+    roomy = o.last_fit()
+    assert not roomy.truncated and roomy.font_px == settings.overlay.font_px
+    settings.overlay.max_height = 0.45
 
     huge = " ".join(["palabra"] * 6000)
     o.show_message("Dudas", huge)
