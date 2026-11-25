@@ -68,3 +68,116 @@ def test_impact_test_runs_full_cycle_silently(qapp, no_popups, configured, monke
         assert no_popups == []
     finally:
         app.quit()
+
+
+# --------------------------------------------------------------------------- conexión preparada
+
+
+def test_keepalive_timer_runs_every_150_s(qapp, no_popups, configured):
+    import main
+
+    app = main.App()
+    try:
+        assert app._keepalive.isActive() and app._keepalive.interval() == main.KEEPALIVE_S * 1000
+    finally:
+        app.quit()
+
+
+def test_keepalive_only_when_idle_and_with_key(qapp, no_popups, configured, monkeypatch):
+    import time
+
+    import main
+
+    app = main.App()
+    try:
+        calls = []
+        monkeypatch.setattr(app, "warm_up", lambda: calls.append(1))
+        app.gemini.last_activity = time.monotonic()  # tráfico reciente
+        app._keepalive_tick()
+        assert calls == []
+        app.gemini.last_activity = time.monotonic() - main.KEEPALIVE_S  # inactivo
+        app._keepalive_tick()
+        assert calls == [1]
+    finally:
+        app.quit()
+
+
+def test_keepalive_skipped_without_key(qapp, no_popups, configured, monkeypatch):
+    import main
+
+    app = main.App()
+    try:
+        calls = []
+        monkeypatch.setattr(app, "warm_up", lambda: calls.append(1))
+        monkeypatch.setattr("app.config.get_api_key", lambda: "")
+        app.gemini.last_activity = 0.0
+        app._keepalive_tick()
+        assert calls == []
+    finally:
+        app.quit()
+
+
+def test_warm_up_updates_last_activity_without_generating():
+    from types import SimpleNamespace as NS
+
+    from app.gemini_client import GeminiService
+
+    asked = []
+    client = NS(models=NS(get=lambda model: asked.append(model)),
+                interactions=NS(create=lambda **kw: pytest.fail("no debe generar texto")))
+    svc = GeminiService(lambda key: client)
+    assert svc.last_activity == 0.0
+    assert svc.warm_up("k", "models/gemini-4-hydrogen") == ""
+    assert asked == ["gemini-4-hydrogen"] and svc.last_activity > 0
+
+
+# --------------------------------------------------------------------------- arrancar con Windows
+
+
+def test_autostart_never_opens_settings_even_if_unconfigured(qapp, no_popups, monkeypatch):
+    import main
+
+    monkeypatch.setattr("app.gemini_client.GeminiService.warm_up", lambda self, key, model: "")
+    app = main.App(from_autostart=True)  # sin API key ni botón
+    try:
+        _wait(qapp, 500)
+        assert app.settings_window is None and no_popups == []
+    finally:
+        app.quit()
+
+
+def test_normal_start_unconfigured_opens_settings(qapp, no_popups, monkeypatch):
+    import main
+
+    monkeypatch.setattr("app.gemini_client.GeminiService.warm_up", lambda self, key, model: "")
+    app = main.App()
+    try:
+        _wait(qapp, 500)
+        assert app.settings_window is not None
+    finally:
+        if app.settings_window is not None:
+            app.settings_window.reject()
+        app.quit()
+
+
+def test_settings_checkbox_applies_autostart_on_save(qapp, configured, monkeypatch):
+    from app import autostart
+    from app.gemini_client import GeminiService
+    from app.input.hub import InputHub
+    from app.settings_window import SettingsWindow
+
+    calls = []
+    monkeypatch.setattr(autostart, "supported", lambda: True)
+    monkeypatch.setattr(autostart, "is_enabled", lambda *a, **k: False)
+    monkeypatch.setattr(autostart, "set_enabled", lambda on, *a, **k: calls.append(on) or True)
+    s = configured
+    hub = InputHub(lambda: s)
+    w = SettingsWindow(s, hub, GeminiService(), True)
+    try:
+        assert w.autostart.isEnabled() and not w.autostart.isChecked()
+        assert w._do_save() and calls == []  # sin cambios: no toca el registro
+        w.autostart.setChecked(True)
+        assert w._do_save() and calls == [True]
+    finally:
+        w.reject()
+        hub.stop()

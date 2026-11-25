@@ -81,8 +81,21 @@ Para generar tu propio `.exe`, ejecuta `build.bat`.
    el modelo según eso.
 5. Activa el **"No molestar"** de Windows (*Configuración → Sistema → Notificaciones*)
    para que **otros** programas tampoco muestren avisos mientras grabas.
+6. Opcional: marca **"Arrancar con Windows"** en *Ajustes → General → Inicio* y no
+   tendrás que acordarte de abrirla.
 
-A partir de ahí: abres la app, abres OBS, y solo el mando.
+A partir de ahí: abres OBS, y solo el mando.
+
+## Arrancar con Windows
+Con la casilla *Ajustes → General → Inicio → "Arrancar con Windows"* la app se abre sola
+al iniciar sesión, **directamente en la bandeja y sin ninguna ventana**, aunque falte
+configurar algo. En ese caso Ajustes se abre desde el icono de la bandeja cuando quieras.
+
+- Se guarda solo para tu usuario, en la lista de arranque de Windows. No necesita
+  permisos de administrador.
+- La verás en *Administrador de tareas → Aplicaciones de arranque* como "OverlayGemini",
+  y también se puede desactivar desde ahí.
+- Si mueves la carpeta del `.exe`, la app corrige la ruta sola la próxima vez que la abras.
 
 ## Velocidad
 Lo que tarda la propia app es menos de 0,6 s por pulsación:
@@ -101,6 +114,16 @@ cuenta que la franja aparece **cuando la respuesta está completa**.
 
 Son estimaciones: mídelo con **Ajustes → Velocidad**. Respuestas más cortas (pídelo en
 el system instruction) = franja antes.
+
+### Conexión siempre preparada (sin gastar tokens)
+La app mantiene abierta la conexión con Gemini. Así, la primera pulsación tras un rato
+sin usarla no tarda ~0,3 s de más en negociar la conexión segura.
+
+- Si pasan 2,5 minutos sin tráfico, pide a Gemini los **datos del modelo**. Es una
+  petición de 1–2 KB: **no genera texto y no gasta tokens**.
+- De paso comprueba la clave. Si al arrancar Windows aún no había red, el estado en
+  Ajustes ("✔ Clave válida…") se corrige solo.
+- No hace nada si no hay API key ni durante la prueba de impacto.
 
 ## Prompts
 Cada prompt tiene:
@@ -161,4 +184,5 @@ Estructura:
 - `app/gemini_client.py`: Interactions API, tiempos y precalentamiento.
 - `app/input/`: mando con SDL2; ratón y teclado solo bajo demanda.
 - `app/win32.py`: exclusión de captura, estilos y prioridad.
+- `app/autostart.py`: arrancar con Windows.
 - `app/settings_window.py`: la ventana de ajustes.

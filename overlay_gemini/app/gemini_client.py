@@ -164,6 +164,12 @@ class GeminiService:
         self._client = None
         self._client_key = None
         self._lock = threading.Lock()
+        # Última vez que se habló con Gemini (petición real o precalentamiento):
+        # mientras sea reciente, la conexión sigue abierta y no hace falta mantenerla.
+        self.last_activity = 0.0
+
+    def _touch(self) -> None:
+        self.last_activity = time.monotonic()
 
     def _client_for(self, api_key: str):
         with self._lock:
@@ -174,8 +180,10 @@ class GeminiService:
 
     def stream(self, api_key: str, request: dict[str, Any]) -> Iterator[StreamPiece]:
         client = self._client_for(api_key)
+        self._touch()
         events = client.interactions.create(timeout=REQUEST_TIMEOUT_S, **request)
         yield from iter_pieces(events)
+        self._touch()
 
     def start(
         self,
@@ -221,14 +229,17 @@ class GeminiService:
         return text, Timing(total=time.perf_counter() - t0, first_text=first), cites
 
     def warm_up(self, api_key: str, model: str) -> str:
-        """Abre la conexión TLS (la comparte la Interactions API) y valida la clave.
+        """Abre (o mantiene abierta) la conexión TLS, que comparte la Interactions API,
+        y valida la clave.
 
+        Solo pide los datos del modelo: no genera texto ni gasta tokens.
         Devuelve "" si todo va bien o un mensaje de error legible. Nunca lanza.
         """
         if not api_key:
             return "Falta la API key."
         try:
             self._client_for(api_key).models.get(model=normalize_model_id(model))
+            self._touch()
             return ""
         except Exception as e:  # noqa: BLE001
             return friendly_error(e)
