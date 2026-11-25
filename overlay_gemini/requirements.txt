@@ -1,0 +1,6 @@
+PySide6-Essentials>=6.7
+google-genai>=2.3.0
+PySDL2>=0.9.16
+pysdl2-dll>=2.30
+pynput>=1.7.7
+keyring>=25
