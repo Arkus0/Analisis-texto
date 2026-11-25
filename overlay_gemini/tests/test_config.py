@@ -82,3 +82,18 @@ def test_saved_file_is_utf8_readable(tmp_path):
     save_settings(default_settings(), path)
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["presets"][1]["name"] == "Definición exacta"
+
+
+def test_new_fields_and_region_validation():
+    from app.config import normalize_region
+
+    s = default_settings()
+    assert s.capture_region is None and s.wait_timeout_s == 40 and s.overlay.fade_ms > 0
+    assert normalize_region([0.1, 0.2, 0.5, 0.5]) == [0.1, 0.2, 0.5, 0.5]
+    assert normalize_region([0.8, 0.8, 0.5, 0.5]) == [0.8, 0.8, 0.2, 0.2]  # recortada al borde
+    assert normalize_region([0, 0, 1, 1]) is None
+    assert normalize_region("basura") is None
+    assert normalize_region([0.1, 0.1, 0.001, 0.5]) is None
+    loaded = settings_from_dict({**settings_to_dict(s), "capture_region": [0.1, 0.1, 0.6, 0.6]})
+    assert loaded.capture_region == [0.1, 0.1, 0.6, 0.6]
+    assert settings_from_dict({"capture_region": [9, 9]}).capture_region is None

@@ -1,5 +1,8 @@
-"""La franja superpuesta: sin foco, transparente al ratón, invisible para OBS y
-autoajustada al tamaño de la respuesta (nunca hay que hacer scroll)."""
+"""Ventanas superpuestas: el icono de espera y la franja con la respuesta.
+
+Ambas son "fantasma": sin foco, transparentes al ratón, invisibles para OBS y con
+fundidos que solo cambian la opacidad. La franja se autoajusta al tamaño de la
+respuesta (nunca hay que hacer scroll) y se maqueta una sola vez."""
 
 from __future__ import annotations
 
@@ -9,7 +12,7 @@ from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
@@ -19,6 +22,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPalette,
+    QPen,
     QTextBlockFormat,
     QTextCursor,
     QTextDocument,
@@ -138,15 +142,14 @@ def document_measure(markdown: str, family: str = FONT_FAMILY) -> tuple[Measure,
     return measure, cache
 
 
-# --------------------------------------------------------------------------- ventana
+# --------------------------------------------------------------------------- ventana base
 
 
-class OverlayWindow(QWidget):
-    LOADING = "loading"
-    TEXT = "text"
-    ERROR = "error"
+class GhostWindow(QWidget):
+    """Ventana 'fantasma': sin foco, transparente al ratón, siempre encima, invisible
+    para OBS y con fundidos que solo cambian la opacidad (no repintan nada)."""
 
-    def __init__(self, settings_provider: Callable[[], Settings]):
+    def __init__(self, settings_provider: Callable[[], Settings], title: str):
         flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -160,27 +163,13 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setWindowTitle("Overlay Gemini")
-
+        self.setWindowTitle(title)
         self._settings = settings_provider
-        self._header = ""
-        self._body = ""
-        self._kind = self.TEXT
-        self._citations: list[Citation] = []
-        self._fit: FitResult | None = None
-        self._doc: QTextDocument | None = None
-        self._dots = 0
         self.capture_excluded = False
-
-        self._relayout_timer = QTimer(self)
-        self._relayout_timer.setSingleShot(True)
-        self._relayout_timer.setInterval(33)  # ~30 recolocaciones/s como máximo
-        self._relayout_timer.timeout.connect(self._relayout)
-
-        self._dots_timer = QTimer(self)
-        self._dots_timer.setInterval(380)
-        self._dots_timer.timeout.connect(self._tick_dots)
-
+        self._fading_out = False
+        self._anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._anim.finished.connect(self._on_anim_finished)
         self.apply_native()
 
     # ----------------------------------------------------------------- nativo
@@ -197,66 +186,207 @@ class OverlayWindow(QWidget):
         self.apply_native()
         win32.bring_topmost(self.hwnd())
 
-    # ----------------------------------------------------------------- API
-    def is_shown(self) -> bool:
-        return self.isVisible()
+    # ----------------------------------------------------------------- fundidos
+    def _fade_ms(self) -> int:
+        return max(0, int(self._settings().overlay.fade_ms))
 
+    def is_shown(self) -> bool:
+        """Visible y no desapareciendo (estado lógico, no visual)."""
+        return self.isVisible() and not self._fading_out
+
+    def fade_in(self, ms: int | None = None) -> None:
+        ms = self._fade_ms() if ms is None else ms
+        self._anim.stop()
+        self._fading_out = False
+        if not self.isVisible():
+            self.setWindowOpacity(0.0 if ms else 1.0)
+            self.show()
+            self.raise_()
+            win32.bring_topmost(self.hwnd())
+        if ms <= 0:
+            self.setWindowOpacity(1.0)
+            return
+        self._anim.setDuration(ms)
+        self._anim.setStartValue(self.windowOpacity())
+        self._anim.setEndValue(1.0)
+        self._anim.start()
+
+    def fade_out(self, ms: int | None = None) -> None:
+        ms = self._fade_ms() if ms is None else ms
+        if not self.isVisible():
+            return
+        self._anim.stop()
+        self._fading_out = True
+        if ms <= 0:
+            self._on_anim_finished()
+            return
+        self._anim.setDuration(ms)
+        self._anim.setStartValue(self.windowOpacity())
+        self._anim.setEndValue(0.0)
+        self._anim.start()
+
+    def hide_now(self) -> None:
+        self._anim.stop()
+        self._fading_out = False
+        self.hide()
+        self.setWindowOpacity(1.0)
+        self._after_hide()
+
+    def _on_anim_finished(self) -> None:
+        if self._fading_out:
+            self._fading_out = False
+            self.hide()
+            self._after_hide()
+
+    def _after_hide(self) -> None:
+        """Para subclases: parar temporizadores al ocultarse."""
+
+    def anchor_point(self) -> tuple[int, int]:
+        """Centro de la franja en coordenadas de pantalla."""
+        settings = self._settings()
+        geo = find_screen(settings.screen_name).geometry()
+        return (geo.x() + geo.width() // 2,
+                int(geo.y() + geo.height() * settings.overlay.vertical_center))
+
+
+# --------------------------------------------------------------------------- icono de espera
+
+
+class BusyIcon(GhostWindow):
+    """Icono pequeño en el centro mientras Gemini prepara la respuesta."""
+
+    SIZE = 64
+    FPS = 30
+
+    def __init__(self, settings_provider: Callable[[], Settings]):
+        super().__init__(settings_provider, "Overlay Gemini · espera")
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self._angle = 0.0
+        self.error = False
+        self._spin = QTimer(self)
+        self._spin.setInterval(1000 // self.FPS)
+        self._spin.timeout.connect(self._tick)
+        self._error_hold = QTimer(self)
+        self._error_hold.setSingleShot(True)
+        self._error_hold.timeout.connect(lambda: self.fade_out())
+
+    def start(self) -> None:
+        """Aparece (fundido) y empieza a girar."""
+        self._error_hold.stop()
+        self.error = False
+        cx, cy = self.anchor_point()
+        self.move(cx - self.SIZE // 2, cy - self.SIZE // 2)
+        self._spin.start()
+        self.update()
+        self.fade_in(min(150, self._fade_ms()))
+
+    def flash_error(self, hold_ms: int = 2000) -> None:
+        """Se pone rojo, se queda quieto `hold_ms` y desaparece solo."""
+        self._spin.stop()
+        self.error = True
+        self.update()
+        if not self.isVisible():
+            cx, cy = self.anchor_point()
+            self.move(cx - self.SIZE // 2, cy - self.SIZE // 2)
+            self.fade_in(min(150, self._fade_ms()))
+        self._error_hold.start(hold_ms)
+
+    def _after_hide(self) -> None:
+        self._spin.stop()
+        self._error_hold.stop()
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 360.0 / self.FPS * 0.9) % 360.0
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 (Qt)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+        bg = QColor(14, 16, 21)
+        bg.setAlphaF(0.88)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(bg)
+        p.drawEllipse(r)
+
+        accent = QColor(COLOR_ERROR if self.error else COLOR_ACCENT)
+        ring = r.adjusted(5, 5, -5, -5)
+        pen = QPen(accent, 3.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self.error:
+            p.drawEllipse(ring)
+        else:
+            faint = QColor(accent)
+            faint.setAlphaF(0.18)
+            p.setPen(QPen(faint, 3.2))
+            p.drawEllipse(ring)
+            p.setPen(pen)
+            p.drawArc(ring, int(-self._angle * 16), int(100 * 16))
+
+        # destello de 4 puntas en el centro
+        c = r.center()
+        s = r.width() * 0.17
+        star = QPainterPath()
+        star.moveTo(c.x(), c.y() - s)
+        star.quadTo(c.x(), c.y(), c.x() + s, c.y())
+        star.quadTo(c.x(), c.y(), c.x(), c.y() + s)
+        star.quadTo(c.x(), c.y(), c.x() - s, c.y())
+        star.quadTo(c.x(), c.y(), c.x(), c.y() - s)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(COLOR_ERROR if self.error else COLOR_TEXT))
+        p.drawPath(star)
+        p.end()
+
+
+# --------------------------------------------------------------------------- franja
+
+
+class OverlayWindow(GhostWindow):
+    """La franja con la respuesta. Se maqueta UNA vez y entra con un fundido."""
+
+    def __init__(self, settings_provider: Callable[[], Settings]):
+        super().__init__(settings_provider, "Overlay Gemini")
+        self._header = ""
+        self._body = ""
+        self._error = False
+        self._citations: list[Citation] = []
+        self._fit: FitResult | None = None
+        self._doc: QTextDocument | None = None
+        self._header_h = self._footer_h = 0
+        self._footer = ""
+
+    # ----------------------------------------------------------------- API
     def has_content(self) -> bool:
         return bool(self._header or self._body)
 
-    def begin(self, header: str) -> None:
+    def set_content(self, header: str, markdown: str, citations: list[Citation] | None = None,
+                    error: bool = False) -> None:
         self._header = header
-        self._body = ""
+        self._body = markdown or "*(Gemini no ha devuelto texto)*"
+        self._error = error
         self._citations = []
-        self._kind = self.LOADING
-        self._dots = 0
-        self._dots_timer.start()
-        self.show_overlay()
-
-    def set_header(self, header: str) -> None:
-        self._header = header
-        self._schedule()
-
-    def set_body(self, markdown: str) -> None:
-        if self._kind == self.LOADING:
-            self._dots_timer.stop()
-        self._kind = self.TEXT
-        self._body = markdown
-        self._schedule()
-
-    def add_citations(self, citations: list[Citation]) -> None:
-        known = {c.url for c in self._citations}
-        for c in citations:
+        known: set[str] = set()
+        for c in citations or []:
             if c.url not in known:
                 self._citations.append(c)
                 known.add(c.url)
-        self._schedule()
 
-    def finish(self, header: str) -> None:
-        self._dots_timer.stop()
-        if self._kind == self.LOADING:
-            self._kind = self.TEXT
-            self._body = self._body or "*(Gemini no ha devuelto texto)*"
-        self._header = header
-        self._schedule()
+    def reveal(self) -> None:
+        """Maqueta con el contenido actual y aparece con un fundido."""
+        self._relayout()
+        self.fade_in()
+
+    def show_answer(self, header: str, markdown: str, citations: list[Citation] | None = None,
+                    error: bool = False) -> None:
+        self.set_content(header, markdown, citations, error)
+        self.reveal()
 
     def show_message(self, header: str, message: str, error: bool = False, show: bool = True) -> None:
-        self._dots_timer.stop()
-        self._header = header
-        self._body = message
-        self._citations = []
-        self._kind = self.ERROR if error else self.TEXT
+        self.set_content(header, message, None, error)
         if show:
-            self.show_overlay()
-
-    def show_overlay(self) -> None:
-        self._relayout()
-        self.show()
-        self.raise_()
-        win32.bring_topmost(self.hwnd())
-
-    def hide_overlay(self) -> None:
-        self.hide()
+            self.reveal()
 
     def body_text(self) -> str:
         return self._body
@@ -265,19 +395,6 @@ class OverlayWindow(QWidget):
         return self._fit
 
     # ----------------------------------------------------------------- layout
-    def _schedule(self) -> None:
-        if self.isVisible() and not self._relayout_timer.isActive():
-            self._relayout_timer.start()
-
-    def _tick_dots(self) -> None:
-        self._dots = (self._dots + 1) % 4
-        self._schedule()
-
-    def _display_markdown(self) -> str:
-        if self._kind == self.LOADING:
-            return "*Analizando" + "." * self._dots + "*"
-        return self._body
-
     def _header_font(self, base_px: int) -> QFont:
         f = QFont(FONT_FAMILY)
         f.setPixelSize(max(11, round(base_px * 0.62)))
@@ -289,8 +406,7 @@ class OverlayWindow(QWidget):
             return ""
         hosts: list[str] = []
         for c in self._citations:
-            host = c.title or urlparse(c.url).netloc
-            host = host.removeprefix("www.")
+            host = (c.title or urlparse(c.url).netloc).removeprefix("www.")
             if host and host not in hosts:
                 hosts.append(host)
         return "Fuentes: " + " · ".join(hosts[:4])
@@ -298,20 +414,17 @@ class OverlayWindow(QWidget):
     def _relayout(self) -> None:
         settings = self._settings()
         style = settings.overlay
-        screen = find_screen(settings.screen_name)
-        geo = screen.geometry()
+        geo = find_screen(settings.screen_name).geometry()
 
-        hf = self._header_font(style.font_px)
-        hfm = QFontMetrics(hf)
+        hfm = QFontMetrics(self._header_font(style.font_px))
         header_h = hfm.height() + GAP if self._header else 0
         header_w = hfm.horizontalAdvance(self._header) + 4 if self._header else 0
         footer = self._footer_text()
-        ffm = QFontMetrics(self._header_font(style.font_px))
-        footer_h = ffm.height() + GAP if footer else 0
+        footer_h = hfm.height() + GAP if footer else 0
 
-        measure, docs = document_measure(self._display_markdown())
+        measure, docs = document_measure(self._body)
         fit = fit_layout(measure, geo.width(), geo.height(), style, header_h, header_w, footer_h)
-        doc = docs.get(fit.font_px) or make_document(self._display_markdown(), fit.font_px)
+        doc = docs.get(fit.font_px) or make_document(self._body, fit.font_px)
         doc.setTextWidth(fit.content_width)
         self._doc, self._fit = doc, fit
         self._header_h, self._footer_h, self._footer = header_h, footer_h, footer
@@ -327,8 +440,7 @@ class OverlayWindow(QWidget):
     def paintEvent(self, event):  # noqa: N802 (Qt)
         if self._fit is None or self._doc is None:
             return
-        settings = self._settings()
-        style = settings.overlay
+        style = self._settings().overlay
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
@@ -339,7 +451,7 @@ class OverlayWindow(QWidget):
         bg = QColor(14, 16, 21)
         bg.setAlphaF(max(0.2, min(1.0, style.opacity)))
         p.fillPath(path, bg)
-        border = QColor(COLOR_ERROR if self._kind == self.ERROR else COLOR_ACCENT)
+        border = QColor(COLOR_ERROR if self._error else COLOR_ACCENT)
         border.setAlphaF(0.35)
         p.setPen(border)
         p.drawPath(path)
@@ -348,7 +460,7 @@ class OverlayWindow(QWidget):
         width = self._fit.content_width
         if self._header:
             p.setFont(self._header_font(style.font_px))
-            p.setPen(COLOR_ERROR if self._kind == self.ERROR else COLOR_MUTED)
+            p.setPen(COLOR_ERROR if self._error else COLOR_MUTED)
             fm = p.fontMetrics()
             p.drawText(PAD_X, y + fm.ascent(), fm.elidedText(self._header, Qt.TextElideMode.ElideRight, width))
             y += self._header_h
@@ -359,9 +471,7 @@ class OverlayWindow(QWidget):
         clip = QRectF(0, 0, width, body_h)
         p.setClipRect(clip)
         ctx = QAbstractTextDocumentLayout.PaintContext()
-        color = COLOR_ERROR if self._kind == self.ERROR else (
-            COLOR_MUTED if self._kind == self.LOADING else COLOR_TEXT)
-        ctx.palette.setColor(QPalette.ColorRole.Text, color)
+        ctx.palette.setColor(QPalette.ColorRole.Text, COLOR_ERROR if self._error else COLOR_TEXT)
         ctx.clip = clip
         self._doc.documentLayout().draw(p, ctx)
         p.restore()
@@ -377,8 +487,7 @@ class OverlayWindow(QWidget):
             grad.setColorAt(1, solid)
             p.fillRect(QRectF(PAD_X, y + body_h - fade_h, width, fade_h), grad)
             p.setPen(COLOR_ACCENT)
-            f = self._header_font(style.font_px)
-            p.setFont(f)
+            p.setFont(self._header_font(style.font_px))
             note = "… respuesta recortada (demasiado larga)"
             fm = p.fontMetrics()
             p.drawText(PAD_X + width - fm.horizontalAdvance(note), int(y + body_h - 4), note)
@@ -387,6 +496,6 @@ class OverlayWindow(QWidget):
             p.setFont(self._header_font(style.font_px))
             p.setPen(COLOR_MUTED)
             fm = p.fontMetrics()
-            fy = self.height() - PAD_Y - fm.descent()
-            p.drawText(PAD_X, fy, fm.elidedText(self._footer, Qt.TextElideMode.ElideRight, width))
+            p.drawText(PAD_X, self.height() - PAD_Y - fm.descent(),
+                       fm.elidedText(self._footer, Qt.TextElideMode.ElideRight, width))
         p.end()

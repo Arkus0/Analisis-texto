@@ -71,6 +71,7 @@ class OverlayStyle:
     opacity: float = 0.90
     font_px: int = 21
     min_font_ratio: float = 0.70
+    fade_ms: int = 220  # duración de los fundidos (0 = sin animación)
 
 
 @dataclass
@@ -80,8 +81,10 @@ class Settings:
     presets: list[Preset] = field(default_factory=list)
     capture_binding: Binding | None = None
     screen_name: str = ""  # vacío = pantalla principal
+    capture_region: list[float] | None = None  # [x, y, w, h] en fracciones; None = pantalla completa
     max_image_width: int = 1920  # 0 = resolución original
     long_press_ms: int = 600
+    wait_timeout_s: int = 40  # pasado este tiempo, el icono se pone rojo
     exclude_from_capture: bool = True
     overlay: OverlayStyle = field(default_factory=OverlayStyle)
 
@@ -202,8 +205,24 @@ def settings_from_dict(data: dict) -> Settings:
         s.capture_binding = _from_dict(Binding, raw_binding)
 
     s.overlay = _from_dict(OverlayStyle, data.get("overlay") or {})
+    s.capture_region = normalize_region(data.get("capture_region"))
     s.active_preset()  # repara active_preset_id si no existe
     return s
+
+
+def normalize_region(region: Any) -> list[float] | None:
+    """Valida una zona [x, y, w, h] (fracciones 0..1). Devuelve None si no sirve."""
+    try:
+        x, y, w, h = (float(v) for v in region)
+    except (TypeError, ValueError):
+        return None
+    x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+    w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+    if w < 0.02 or h < 0.02:
+        return None
+    if x == 0.0 and y == 0.0 and w >= 0.999 and h >= 0.999:
+        return None  # es la pantalla completa
+    return [round(x, 5), round(y, 5), round(w, 5), round(h, 5)]
 
 
 def load_settings(path: Path | None = None) -> Settings:

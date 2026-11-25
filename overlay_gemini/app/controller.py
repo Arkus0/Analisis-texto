@@ -1,34 +1,57 @@
-"""Lógica del botón: captura → Gemini → mostrar / ocultar, con pulsación larga.
+"""Lógica del botón con tres estados: IDLE → WAITING → SHOWING.
 
-Pulsación corta con la franja oculta  → nueva captura y pregunta.
-Pulsación corta con la franja visible → ocultar.
-Pulsación larga (≥ long_press_ms)     → volver a mostrar la última respuesta.
+Pulsación corta en IDLE     → captura, icono de espera, petición en segundo plano.
+Respuesta lista en WAITING  → el icono se desvanece y entra la franja.
+Pulsación corta en WAITING  → cancela la espera; la respuesta se guarda en silencio
+                              y NUNCA aparece sola después.
+Pulsación corta en SHOWING  → la franja se desvanece.
+Error / tiempo agotado      → solo el icono se pone rojo 2 s (si estaba visible).
+Pulsación larga             → última respuesta (o error); si aún está pendiente,
+                              vuelve a mostrar el icono de espera.
 """
 
 from __future__ import annotations
 
+import logging
 import time
-from typing import Callable, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol
 
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from .config import Settings, get_api_key
-from .gemini_client import GeminiService, StreamPiece, build_request
+from .gemini_client import Citation, StreamPiece, Timing, build_request
+
+log = logging.getLogger("overlay_gemini")
 
 DEBOUNCE_S = 0.25
+ERROR_HOLD_MS = 2000
+
+IDLE, WAITING, SHOWING = "idle", "waiting", "showing"
 
 
-class OverlayLike(Protocol):
+class BandLike(Protocol):
     def is_shown(self) -> bool: ...
     def has_content(self) -> bool: ...
-    def begin(self, header: str) -> None: ...
-    def set_header(self, header: str) -> None: ...
-    def set_body(self, markdown: str) -> None: ...
-    def add_citations(self, citations) -> None: ...
-    def finish(self, header: str) -> None: ...
-    def show_message(self, header: str, message: str, error: bool = False, show: bool = True) -> None: ...
-    def show_overlay(self) -> None: ...
-    def hide_overlay(self) -> None: ...
+    def show_answer(self, header: str, markdown: str, citations=None, error: bool = False) -> None: ...
+    def fade_out(self, ms: int | None = None) -> None: ...
+    def hide_now(self) -> None: ...
+
+
+class IconLike(Protocol):
+    def start(self) -> None: ...
+    def flash_error(self, hold_ms: int = ERROR_HOLD_MS) -> None: ...
+    def fade_out(self, ms: int | None = None) -> None: ...
+    def hide_now(self) -> None: ...
+    def is_shown(self) -> bool: ...
+
+
+@dataclass
+class Result:
+    header: str
+    text: str
+    error: bool = False
+    citations: list[Citation] = field(default_factory=list)
 
 
 def _fmt_seconds(s: float) -> str:
@@ -36,40 +59,66 @@ def _fmt_seconds(s: float) -> str:
 
 
 class Controller(QObject):
-    # Señales para pasar del hilo de Gemini al hilo de la interfaz.
+    # Del hilo de Gemini al hilo de la interfaz.
     _piece = Signal(int, object)
-    _done = Signal(int)
+    _done = Signal(int, object)
     _failed = Signal(int, str)
 
-    status_changed = Signal(str)
+    state_changed = Signal(str)
 
     def __init__(
         self,
-        overlay: OverlayLike,
+        band: BandLike,
+        icon: IconLike,
         settings_provider: Callable[[], Settings],
-        capture: Callable[[Settings], bytes],
-        gemini: GeminiService,
+        grab: Callable[[Settings], Any],
+        prepare: Callable[[Any, Settings], bytes],
+        gemini,
         api_key_provider: Callable[[], str] = get_api_key,
         clock: Callable[[], float] = time.monotonic,
     ):
         super().__init__()
-        self.overlay = overlay
+        self.band = band
+        self.icon = icon
         self._settings = settings_provider
-        self._capture = capture
+        self._grab = grab
+        self._prepare = prepare
         self._gemini = gemini
         self._api_key = api_key_provider
         self._clock = clock
 
+        self.state = IDLE
         self._down_at: float | None = None
         self._last_action = -1e9
         self._rid = 0
+        self._pending = False
         self._text = ""
-        self._started = 0.0
+        self._citations: list[Citation] = []
         self._header_base = ""
+        self._started = 0.0
+        self.last: Result | None = None
+
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(self._on_timeout)
 
         self._piece.connect(self._on_piece)
         self._done.connect(self._on_done)
         self._failed.connect(self._on_failed)
+
+    # ----------------------------------------------------------------- backend (prueba de impacto)
+    def set_backend(self, gemini, api_key_provider: Callable[[], str]) -> None:
+        self._gemini = gemini
+        self._api_key = api_key_provider
+
+    @property
+    def backend(self):
+        return self._gemini, self._api_key
+
+    def _set_state(self, state: str) -> None:
+        if state != self.state:
+            self.state = state
+            self.state_changed.emit(state)
 
     # ----------------------------------------------------------------- botón
     @Slot()
@@ -89,17 +138,46 @@ class Controller(QObject):
         self._last_action = now
         if held * 1000 >= self._settings().long_press_ms:
             self.show_last()
-        elif self.overlay.is_shown():
-            self.overlay.hide_overlay()
+        else:
+            self.toggle()
+
+    def toggle(self) -> None:
+        """Lo que hace una pulsación corta."""
+        if self.state == WAITING:
+            self.cancel_wait()
+        elif self.state == SHOWING:
+            self.hide_answer()
         else:
             self.capture_and_ask()
 
     # ----------------------------------------------------------------- acciones
+    def reset(self) -> None:
+        """Lo oculta todo al instante y descarta lo pendiente (fin de la prueba de impacto)."""
+        self._rid += 1
+        self._pending = False
+        self._timeout.stop()
+        self.icon.hide_now()
+        self.band.hide_now()
+        self._set_state(IDLE)
+
+    def cancel_wait(self) -> None:
+        self.icon.fade_out()
+        self._set_state(IDLE)
+
+    def hide_answer(self) -> None:
+        self.band.fade_out()
+        self._set_state(IDLE)
+
     def show_last(self) -> None:
-        if self.overlay.has_content():
-            self.overlay.show_overlay()
-        else:
-            self.overlay.show_message("Overlay Gemini", "Aún no hay ninguna respuesta.")
+        if self._pending:
+            self.band.hide_now()
+            self.icon.start()
+            self._set_state(WAITING)
+        elif self.last is not None:
+            self.icon.hide_now()
+            self.band.show_answer(self.last.header, self.last.text, self.last.citations, self.last.error)
+            self._set_state(SHOWING)
+        # Sin nada que mostrar: no se hace nada (nada de avisos).
 
     def capture_and_ask(self) -> None:
         settings = self._settings()
@@ -108,35 +186,55 @@ class Controller(QObject):
         self._rid += 1
         rid = self._rid
         self._text = ""
+        self._citations = []
         self._header_base = f"{preset.name} · {model}"
+
+        # Lo que quede en pantalla (p. ej. un fundido de salida) se quita antes de capturar.
+        self.band.hide_now()
+        self.icon.hide_now()
 
         key = self._api_key()
         if not key:
-            self.overlay.show_message(
-                "Falta la API key", "Abre **Ajustes** (icono de la bandeja) y pega tu API key de Gemini.",
-                error=True)
+            self._store_error("Falta la API key: abre Ajustes (icono de la bandeja) y pégala.")
+            self.icon.flash_error(ERROR_HOLD_MS)
             return
         try:
-            image = self._capture(settings)
+            t0 = time.perf_counter()
+            image = self._grab(settings)
+            grab_ms = (time.perf_counter() - t0) * 1000
         except Exception as e:  # noqa: BLE001
-            self.overlay.show_message("Error de captura", str(e), error=True)
+            log.warning("Fallo de captura: %s", e)
+            self._store_error(f"Error de captura: {e}")
+            self.icon.flash_error(ERROR_HOLD_MS)
             return
 
+        self._pending = True
         self._started = self._clock()
-        self.overlay.begin(self._header_base)
-        self.status_changed.emit("analizando")
-        request = build_request(preset, settings, image)
+        self.icon.start()
+        self._set_state(WAITING)
+        self._timeout.start(max(5, int(settings.wait_timeout_s)) * 1000)
+        log.info("Captura %.0f ms · %s", grab_ms, self._header_base)
+
+        prepare = self._prepare
+
+        def make_request():  # se ejecuta en el hilo de la petición
+            return build_request(preset, settings, prepare(image, settings))
+
         self._gemini.start(
             key,
-            request,
+            make_request,
             on_piece=lambda piece: self._piece.emit(rid, piece),
-            on_done=lambda: self._done.emit(rid),
+            on_done=lambda timing=None: self._done.emit(rid, timing),
             on_error=lambda msg: self._failed.emit(rid, msg),
         )
 
     # ----------------------------------------------------------------- respuestas
-    def _elapsed(self) -> str:
-        return _fmt_seconds(self._clock() - self._started)
+    def _store_error(self, message: str) -> None:
+        self._pending = False
+        self._timeout.stop()
+        header = f"Error · {self._header_base}" if self._header_base else "Error"
+        self.last = Result(header, message, error=True)
+        log.warning("%s", message)
 
     @Slot(int, object)
     def _on_piece(self, rid: int, piece: StreamPiece) -> None:
@@ -144,23 +242,43 @@ class Controller(QObject):
             return  # respuesta de una captura anterior
         if piece.text:
             self._text += piece.text
-            self.overlay.set_body(self._text)
         if piece.citations:
-            self.overlay.add_citations(piece.citations)
+            self._citations.extend(piece.citations)
 
-    @Slot(int)
-    def _on_done(self, rid: int) -> None:
+    @Slot(int, object)
+    def _on_done(self, rid: int, timing: Timing | None) -> None:
         if rid != self._rid:
             return
-        self.overlay.finish(f"{self._header_base} · {self._elapsed()}")
-        self.status_changed.emit("listo")
+        self._pending = False
+        self._timeout.stop()
+        elapsed = self._clock() - self._started
+        self.last = Result(f"{self._header_base} · {_fmt_seconds(elapsed)}", self._text,
+                           citations=list(self._citations))
+        if timing is not None:
+            first = f"{timing.first_text:.2f}s" if timing.first_text is not None else "-"
+            log.info("Respuesta: total %.2fs · primer texto %s · %d caracteres",
+                     timing.total, first, len(self._text))
+        if self.state == WAITING:
+            self.icon.fade_out()
+            self.band.show_answer(self.last.header, self.last.text, self.last.citations)
+            self._set_state(SHOWING)
+        # Si el usuario canceló la espera, se guarda en silencio (pulsación larga).
 
     @Slot(int, str)
     def _on_failed(self, rid: int, message: str) -> None:
         if rid != self._rid:
             return
-        # Si el usuario ya había ocultado la franja, no se la volvemos a poner delante:
-        # el error queda guardado y se ve con una pulsación larga.
-        self.overlay.show_message(f"Error · {self._header_base}", message, error=True,
-                                  show=self.overlay.is_shown())
-        self.status_changed.emit("error")
+        self._store_error(message)
+        if self.state == WAITING:
+            self.icon.flash_error(ERROR_HOLD_MS)
+            self._set_state(IDLE)
+
+    def _on_timeout(self) -> None:
+        if not self._pending:
+            return
+        self._rid += 1  # lo que llegue después se descarta
+        secs = max(5, int(self._settings().wait_timeout_s))
+        self._store_error(f"Gemini no ha respondido en {secs} s.")
+        if self.state == WAITING:
+            self.icon.flash_error(ERROR_HOLD_MS)
+            self._set_state(IDLE)

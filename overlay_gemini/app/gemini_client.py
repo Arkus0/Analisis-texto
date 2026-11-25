@@ -7,6 +7,7 @@ Google no guarda la petición para recuperarla después.
 from __future__ import annotations
 
 import base64
+import time
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator
@@ -135,11 +136,24 @@ def friendly_error(exc: BaseException) -> str:
 
 ClientFactory = Callable[[str], Any]
 
+# Pocos reintentos y cortos: si algo falla, mejor saberlo enseguida (icono rojo)
+# que tener el icono girando un minuto.
+HTTP_OPTIONS = {"retry_options": {"attempts": 2, "initial_delay": 0.5, "max_delay": 1.0}}
+
 
 def _default_client_factory(api_key: str) -> Any:
     from google import genai
 
-    return genai.Client(api_key=api_key)
+    return genai.Client(api_key=api_key, http_options=HTTP_OPTIONS)
+
+
+@dataclass
+class Timing:
+    total: float
+    first_text: float | None = None  # segundos hasta el primer trozo de texto
+
+
+RequestSource = dict[str, Any] | Callable[[], dict[str, Any]]
 
 
 class GeminiService:
@@ -166,25 +180,58 @@ class GeminiService:
     def start(
         self,
         api_key: str,
-        request: dict[str, Any],
+        request: RequestSource,
         on_piece: Callable[[StreamPiece], None],
-        on_done: Callable[[], None],
+        on_done: Callable[[Timing], None],
         on_error: Callable[[str], None],
     ) -> threading.Thread:
+        """`request` puede ser un dict o una función que lo construye (se ejecuta en
+        el hilo de la petición, así la codificación de la imagen no toca la interfaz)."""
+
         def run():
+            t0 = time.perf_counter()
+            first: float | None = None
             try:
-                for piece in self.stream(api_key, request):
+                req = request() if callable(request) else request
+                for piece in self.stream(api_key, req):
+                    if first is None and piece.text:
+                        first = time.perf_counter() - t0
                     on_piece(piece)
             except GeminiError as e:
                 on_error(str(e))
-            except Exception as e:  # noqa: BLE001 - cualquier fallo se muestra en la franja
+            except Exception as e:  # noqa: BLE001 - cualquier fallo acaba en el icono rojo
                 on_error(friendly_error(e))
             else:
-                on_done()
+                on_done(Timing(total=time.perf_counter() - t0, first_text=first))
 
         t = threading.Thread(target=run, name="gemini-request", daemon=True)
         t.start()
         return t
+
+    def measure(self, api_key: str, request: dict[str, Any]) -> tuple[str, Timing, list[Citation]]:
+        """Ejecuta una petición completa de forma síncrona (para "Comparar velocidad")."""
+        t0 = time.perf_counter()
+        first: float | None = None
+        text, cites = "", []
+        for piece in self.stream(api_key, request):
+            if first is None and piece.text:
+                first = time.perf_counter() - t0
+            text += piece.text
+            cites.extend(piece.citations)
+        return text, Timing(total=time.perf_counter() - t0, first_text=first), cites
+
+    def warm_up(self, api_key: str, model: str) -> str:
+        """Abre la conexión TLS (la comparte la Interactions API) y valida la clave.
+
+        Devuelve "" si todo va bien o un mensaje de error legible. Nunca lanza.
+        """
+        if not api_key:
+            return "Falta la API key."
+        try:
+            self._client_for(api_key).models.get(model=normalize_model_id(model))
+            return ""
+        except Exception as e:  # noqa: BLE001
+            return friendly_error(e)
 
     def list_models(self, api_key: str) -> list[str]:
         client = self._client_for(api_key)

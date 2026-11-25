@@ -1,7 +1,7 @@
 import pytest
 
 from app.config import OverlayStyle, default_settings
-from app.overlay import PAD_X, PAD_Y, OverlayWindow, compact_markdown, fit_layout
+from app.overlay import PAD_X, OverlayWindow, compact_markdown, fit_layout
 
 SCREEN_W, SCREEN_H = 1920, 1080
 
@@ -76,7 +76,7 @@ def overlay(qapp):
     settings = default_settings()
     o = OverlayWindow(lambda: settings)
     yield o, settings
-    o.hide_overlay()
+    o.hide_now()
     o.deleteLater()
 
 
@@ -126,16 +126,72 @@ def test_window_fits_real_text_sizes(overlay, qapp):
     assert abs(centre - screen_h * settings.overlay.vertical_center) <= 1
 
 
-def test_streaming_relayout_and_paint(overlay, qapp):
+def _wait_anim(qapp, ms=600):
+    from PySide6.QtCore import QElapsedTimer
+
+    t = QElapsedTimer()
+    t.start()
+    while t.elapsed() < ms:
+        qapp.processEvents()
+
+
+def test_show_answer_lays_out_once_and_fades_in_and_out(overlay, qapp):
+    o, settings = overlay
+    calls = []
+    original = o._relayout
+    o._relayout = lambda: (calls.append(1), original())[1]
+    o.show_answer("Dudas · gemini-4-hydrogen · 1,2 s", "Hola **mundo** " * 30)
+    assert calls == [1]  # una sola maquetación
+    assert o.is_shown() and o.windowOpacity() < 1.0  # empieza el fundido
+    _wait_anim(qapp, settings.overlay.fade_ms + 250)
+    assert o.windowOpacity() == pytest.approx(1.0)
+    assert not o.grab().isNull()  # pinta sin errores
+    o.fade_out()
+    assert not o.is_shown()  # lógicamente oculta en cuanto empieza a desvanecerse
+    _wait_anim(qapp, settings.overlay.fade_ms + 250)
+    assert not o.isVisible()
+
+
+def test_fade_zero_is_instant(overlay, qapp):
+    o, settings = overlay
+    settings.overlay.fade_ms = 0
+    o.show_answer("x", "texto")
+    assert o.isVisible() and o.windowOpacity() == pytest.approx(1.0)
+    o.fade_out()
+    assert not o.isVisible()
+
+
+def test_fade_in_interrupts_fade_out(overlay, qapp):
+    o, settings = overlay
+    o.show_answer("x", "texto")
+    _wait_anim(qapp, settings.overlay.fade_ms + 250)
+    o.fade_out()
+    o.reveal()  # pulsación larga a mitad del fundido de salida
+    _wait_anim(qapp, settings.overlay.fade_ms + 250)
+    assert o.isVisible() and o.is_shown()
+
+
+def test_error_answer_paints(overlay):
     o, _ = overlay
-    o.begin("Dudas · gemini-4-hydrogen")
-    assert o.is_shown()
-    o.set_body("Hola")
-    o.set_body("Hola **mundo** " * 30)
-    qapp.processEvents()
-    o._relayout()
-    img = o.grab()  # fuerza paintEvent
-    assert not img.isNull()
-    o.finish("Dudas · gemini-4-hydrogen · 1,2 s")
-    assert o.body_text().startswith("Hola")
-    assert PAD_Y > 0
+    o.show_answer("Error · Dudas", "Cuota agotada (429)", error=True)
+    assert not o.grab().isNull()
+
+
+def test_busy_icon_spins_only_while_visible_and_flashes_red(qapp):
+    from app.overlay import BusyIcon
+
+    settings = default_settings()
+    icon = BusyIcon(lambda: settings)
+    icon.start()
+    assert icon.is_shown() and icon._spin.isActive() and not icon.error
+    geo = qapp.primaryScreen().geometry()
+    centre = icon.geometry().center()
+    assert abs(centre.x() - geo.center().x()) <= 1
+    assert abs(centre.y() - geo.height() * settings.overlay.vertical_center) <= 1
+    assert not icon.grab().isNull()
+    icon.flash_error(hold_ms=50)
+    assert icon.error and not icon._spin.isActive()
+    assert not icon.grab().isNull()
+    _wait_anim(qapp, 50 + settings.overlay.fade_ms + 300)
+    assert not icon.isVisible() and not icon._spin.isActive()
+    icon.deleteLater()

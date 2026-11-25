@@ -69,3 +69,79 @@ def test_hub_learning_and_escape(qapp):
     hub.raw_event.emit(keyboard_event(0x1B, True))
     qapp.processEvents()
     assert events == ["cancel"]
+
+
+# --------------------------------------------------------------------------- hooks bajo demanda
+
+
+class FakeGamepad:
+    def __init__(self, emit):
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+        return None
+
+    def stop(self):
+        pass
+
+
+class FakeMouseKb:
+    def __init__(self, emit, binding, learning):
+        self.running = False
+        self.starts = 0
+        self.stops = 0
+
+    def start(self):
+        self.running = True
+        self.starts += 1
+        return []
+
+    def stop(self):
+        self.running = False
+        self.stops += 1
+
+
+def _hub_with_fakes(settings):
+    return InputHub(lambda: settings, gamepad_factory=FakeGamepad, mouse_kb_factory=FakeMouseKb)
+
+
+def test_no_global_hooks_with_gamepad_binding(qapp):
+    s = default_settings()
+    s.capture_binding = Binding("gamepad", "a", "Mando: A")
+    hub = _hub_with_fakes(s)
+    hub.start()
+    assert hub.gamepad.started == 1
+    assert not hub.mouse_kb.running and hub.mouse_kb.starts == 0
+
+
+def test_no_hooks_without_binding_either(qapp):
+    hub = _hub_with_fakes(default_settings())
+    hub.start()
+    assert hub.mouse_kb.starts == 0
+
+
+def test_hooks_only_for_mouse_or_keyboard_and_removed_when_switching(qapp):
+    s = default_settings()
+    s.capture_binding = Binding("mouse", "x1", "X1")
+    hub = _hub_with_fakes(s)
+    hub.start()
+    assert hub.mouse_kb.running
+    s.capture_binding = Binding("gamepad", "a")
+    hub.sync_hooks()
+    assert not hub.mouse_kb.running and hub.mouse_kb.stops == 1
+
+
+def test_hooks_are_temporary_while_learning(qapp):
+    s = default_settings()
+    s.capture_binding = Binding("gamepad", "a")
+    hub = _hub_with_fakes(s)
+    hub.start()
+    hub.begin_learn()
+    assert hub.mouse_kb.running  # para poder asignar ratón/teclado
+    hub.raw_event.emit(InputEvent("gamepad", "b", True, "Mando: B"))
+    qapp.processEvents()
+    assert not hub.learning and not hub.mouse_kb.running  # se quitan al terminar
+    hub.begin_learn()
+    hub.cancel_learn()
+    assert not hub.mouse_kb.running

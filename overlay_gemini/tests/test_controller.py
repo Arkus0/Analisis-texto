@@ -1,55 +1,58 @@
 import pytest
 
 from app.config import default_settings
-from app.controller import Controller
-from app.gemini_client import Citation, StreamPiece
+from app.controller import IDLE, SHOWING, WAITING, Controller
+from app.gemini_client import Citation, StreamPiece, Timing
 
 
-class FakeOverlay:
+class FakeBand:
     def __init__(self):
         self.shown = False
-        self.header = ""
-        self.body = ""
-        self.error = False
-        self.citations = []
+        self.answer = None
         self.calls = []
 
     def is_shown(self):
         return self.shown
 
     def has_content(self):
-        return bool(self.header or self.body)
+        return self.answer is not None
 
-    def begin(self, header):
-        self.calls.append("begin")
-        self.header, self.body, self.error, self.shown = header, "", False, True
-
-    def set_header(self, header):
-        self.header = header
-
-    def set_body(self, md):
-        self.body = md
-
-    def add_citations(self, c):
-        self.citations += c
-
-    def finish(self, header):
-        self.calls.append("finish")
-        self.header = header
-
-    def show_message(self, header, message, error=False, show=True):
-        self.calls.append("message")
-        self.header, self.body, self.error = header, message, error
-        if show:
-            self.shown = True
-
-    def show_overlay(self):
+    def show_answer(self, header, markdown, citations=None, error=False):
         self.calls.append("show")
+        self.answer = dict(header=header, text=markdown, citations=citations, error=error)
         self.shown = True
 
-    def hide_overlay(self):
-        self.calls.append("hide")
+    def fade_out(self, ms=None):
+        self.calls.append("fade_out")
         self.shown = False
+
+    def hide_now(self):
+        self.shown = False
+
+
+class FakeIcon:
+    def __init__(self):
+        self.shown = False
+        self.error = False
+        self.calls = []
+
+    def start(self):
+        self.calls.append("start")
+        self.shown, self.error = True, False
+
+    def flash_error(self, hold_ms=2000):
+        self.calls.append("error")
+        self.shown, self.error = True, True
+
+    def fade_out(self, ms=None):
+        self.calls.append("fade_out")
+        self.shown = False
+
+    def hide_now(self):
+        self.shown = False
+
+    def is_shown(self):
+        return self.shown
 
 
 class FakeGemini:
@@ -59,7 +62,8 @@ class FakeGemini:
         self.requests = []
 
     def start(self, key, request, on_piece, on_done, on_error):
-        self.requests.append(dict(request=request, piece=on_piece, done=on_done, error=on_error))
+        built = request() if callable(request) else request
+        self.requests.append(dict(request=built, piece=on_piece, done=on_done, error=on_error))
 
 
 class Clock:
@@ -70,131 +74,179 @@ class Clock:
         return self.t
 
 
+class Env:
+    def __init__(self, qapp, api_key="key", grab=None):
+        self.qapp = qapp
+        self.settings = default_settings()
+        self.band, self.icon, self.gemini, self.clock = FakeBand(), FakeIcon(), FakeGemini(), Clock()
+        self.grabs, self.prepared = [], []
+
+        def default_grab(s):
+            self.grabs.append(s)
+            return "IMAGEN"
+
+        def prepare(img, s):
+            self.prepared.append(img)
+            return b"jpeg"
+
+        self.c = Controller(self.band, self.icon, lambda: self.settings, grab or default_grab, prepare,
+                            self.gemini, api_key_provider=lambda: api_key, clock=self.clock)
+
+    def tap(self, held=0.1, gap=1.0):
+        self.clock.t += gap
+        self.c.press()
+        self.clock.t += held
+        self.c.release()
+        self.qapp.processEvents()
+
+    def last(self):
+        return self.gemini.requests[-1]
+
+
 @pytest.fixture
 def env(qapp):
-    settings = default_settings()
-    overlay, gemini, clock = FakeOverlay(), FakeGemini(), Clock()
-    captures = []
-
-    def capture(s):
-        captures.append(s)
-        return b"jpeg"
-
-    c = Controller(overlay, lambda: settings, capture, gemini, api_key_provider=lambda: "key", clock=clock)
-    return NS(c=c, overlay=overlay, gemini=gemini, clock=clock, settings=settings, captures=captures, qapp=qapp)
+    return Env(qapp)
 
 
-class NS:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-
-def tap(e, held=0.1, gap=1.0):
-    e.clock.t += gap
-    e.c.press()
-    e.clock.t += held
-    e.c.release()
-    e.qapp.processEvents()
-
-
-def test_toggle_cycle_capture_hide_capture(env):
-    tap(env)
-    assert env.overlay.shown and len(env.captures) == 1 and env.overlay.calls == ["begin"]
-    assert env.overlay.header.startswith("Dudas · gemini-4-hydrogen")
-    tap(env)
-    assert not env.overlay.shown and len(env.captures) == 1
-    tap(env)
-    assert env.overlay.shown and len(env.captures) == 2
-
-
-def test_streaming_updates_body_and_finishes_with_elapsed(env):
-    tap(env)
-    r = env.gemini.requests[-1]
+def test_press_shows_icon_then_band_when_complete(env):
+    env.tap()
+    assert env.c.state == WAITING
+    assert env.icon.shown and not env.band.shown
+    assert env.grabs and env.prepared == ["IMAGEN"]  # imagen preparada en el "hilo" de la petición
+    r = env.last()
     r["piece"](StreamPiece(text="Hola "))
     r["piece"](StreamPiece(text="mundo"))
-    r["piece"](StreamPiece(citations=[Citation("https://boe.es", "boe.es")]))
-    env.clock.t += 2.34
-    r["done"]()
+    assert not env.band.shown  # nada de streaming en pantalla: solo al terminar
+    env.clock.t += 2.4
+    r["done"](Timing(total=2.4, first_text=0.9))
     env.qapp.processEvents()
-    assert env.overlay.body == "Hola mundo"
-    assert env.overlay.citations == [Citation("https://boe.es", "boe.es")]
-    assert env.overlay.header.endswith("s") and "," in env.overlay.header
+    assert env.c.state == SHOWING
+    assert env.band.shown and not env.icon.shown
+    assert env.band.answer["text"] == "Hola mundo"
+    assert env.band.answer["header"].startswith("Dudas · gemini-4-hydrogen · 2,4 s")
+
+
+def test_second_press_hides_with_fade(env):
+    env.tap()
+    env.last()["done"](None)
+    env.tap()
+    assert env.c.state == IDLE and env.band.calls[-1] == "fade_out"
+    env.tap()
+    assert env.c.state == WAITING and len(env.gemini.requests) == 2
+
+
+def test_cancel_while_waiting_never_pops_up_later(env):
+    env.tap()
+    r = env.last()
+    env.tap()  # cancelar la espera
+    assert env.c.state == IDLE and not env.icon.shown
+    r["piece"](StreamPiece(text="tardía"))
+    r["done"](None)
+    env.qapp.processEvents()
+    assert not env.band.shown and env.band.calls == []  # no aparece sola
+    env.tap(held=0.8)  # pulsación larga: ahora sí
+    assert env.band.shown and env.band.answer["text"] == "tardía"
+    assert len(env.gemini.requests) == 1
+
+
+def test_long_press_while_pending_shows_icon_again_and_then_band(env):
+    env.tap()
+    r = env.last()
+    env.tap()  # cancelar
+    env.tap(held=0.8)  # larga: la respuesta aún no ha llegado
+    assert env.c.state == WAITING and env.icon.shown
+    r["done"](None)
+    env.qapp.processEvents()
+    assert env.c.state == SHOWING and env.band.shown
+
+
+def test_error_turns_icon_red_without_band(env):
+    env.tap()
+    env.last()["error"]("Cuota agotada (429)")
+    env.qapp.processEvents()
+    assert env.c.state == IDLE
+    assert env.icon.error and env.icon.calls[-1] == "error"
+    assert not env.band.shown and env.band.calls == []
+    env.tap(held=0.8)  # el error se puede leer con una pulsación larga
+    assert env.band.answer["error"] and "429" in env.band.answer["text"]
+
+
+def test_error_after_cancel_is_silent(env):
+    env.tap()
+    r = env.last()
+    env.tap()
+    r["error"]("falló")
+    env.qapp.processEvents()
+    assert "error" not in env.icon.calls and not env.band.shown
+    assert env.c.last.error
+
+
+def test_timeout_turns_icon_red_and_discards_late_answer(env):
+    env.settings.wait_timeout_s = 5
+    env.tap()
+    r = env.last()
+    env.c._on_timeout()  # equivalente a que salte el QTimer
+    assert env.c.state == IDLE and env.icon.error
+    assert "no ha respondido" in env.c.last.text
+    r["piece"](StreamPiece(text="tarde"))
+    r["done"](None)
+    env.qapp.processEvents()
+    assert not env.band.shown
 
 
 def test_stale_responses_are_ignored(env):
-    tap(env)
-    old = env.gemini.requests[-1]
-    tap(env)  # oculta
-    tap(env)  # nueva captura
-    new = env.gemini.requests[-1]
+    env.tap()
+    old = env.last()
+    env.tap()  # cancelar
+    env.tap()  # nueva captura
+    new = env.last()
     old["piece"](StreamPiece(text="VIEJA"))
+    old["done"](None)
     new["piece"](StreamPiece(text="nueva"))
+    new["piece"](StreamPiece(citations=[Citation("https://boe.es", "boe.es")]))
+    new["done"](None)
     env.qapp.processEvents()
-    assert env.overlay.body == "nueva"
+    assert env.band.answer["text"] == "nueva"
+    assert env.band.answer["citations"] == [Citation("https://boe.es", "boe.es")]
 
 
-def test_text_keeps_arriving_while_hidden_and_long_press_shows_it(env):
-    tap(env)
-    r = env.gemini.requests[-1]
-    tap(env)  # ocultar antes de que llegue la respuesta
-    r["piece"](StreamPiece(text="respuesta"))
-    r["done"]()
-    env.qapp.processEvents()
-    assert not env.overlay.shown and env.overlay.body == "respuesta"
-    tap(env, held=0.8)  # pulsación larga
-    assert env.overlay.shown and len(env.captures) == 1  # sin nueva captura
-
-
-def test_debounce_ignores_bounces(env):
-    tap(env)
-    tap(env, gap=0.05)  # rebote: < 250 ms desde la última acción
-    assert env.overlay.shown
-
-
-def test_keyboard_autorepeat_press_is_ignored(env):
+def test_debounce_and_autorepeat(env):
+    env.tap()
+    env.tap(gap=0.05)  # rebote
+    assert env.c.state == WAITING
     env.c.press()
     env.clock.t += 0.3
-    env.c.press()  # auto-repetición
+    env.c.press()  # auto-repetición de teclado: se ignora
     env.clock.t += 0.4
-    env.c.release()  # 0,7 s desde la primera pulsación → larga
-    env.qapp.processEvents()
-    assert env.overlay.calls == ["message"]  # "aún no hay respuesta"
-    assert env.captures == []
+    env.c.release()  # 0,7 s → larga
+    assert env.c.state == WAITING and len(env.gemini.requests) == 1
 
 
-def test_error_while_visible_is_shown_in_red(env):
-    tap(env)
-    env.gemini.requests[-1]["error"]("Cuota agotada (429)")
-    env.qapp.processEvents()
-    assert env.overlay.shown and env.overlay.error and "429" in env.overlay.body
+def test_long_press_with_nothing_does_nothing(env):
+    env.tap(held=0.8)
+    assert env.c.state == IDLE and not env.band.shown and not env.icon.shown
 
 
-def test_error_while_hidden_stays_hidden(env):
-    tap(env)
-    r = env.gemini.requests[-1]
-    tap(env)
-    r["error"]("falló")
-    env.qapp.processEvents()
-    assert not env.overlay.shown and env.overlay.error
+def test_missing_api_key_flashes_red_icon_only(qapp):
+    e = Env(qapp, api_key="")
+    e.tap()
+    assert e.icon.error and not e.band.shown and not e.grabs and not e.gemini.requests
+    assert "API key" in e.c.last.text
 
 
-def test_missing_api_key_shows_message_without_capturing(qapp):
-    settings = default_settings()
-    overlay, gemini = FakeOverlay(), FakeGemini()
-    captured = []
-    c = Controller(overlay, lambda: settings, lambda s: captured.append(1) or b"", gemini,
-                   api_key_provider=lambda: "")
-    c.capture_and_ask()
-    assert overlay.error and "API key" in overlay.header and not captured and not gemini.requests
-
-
-def test_capture_failure_is_reported(qapp):
-    settings = default_settings()
-    overlay, gemini = FakeOverlay(), FakeGemini()
-
+def test_capture_failure_flashes_red_icon(qapp):
     def boom(s):
         raise RuntimeError("pantalla negra")
 
-    c = Controller(overlay, lambda: settings, boom, gemini, api_key_provider=lambda: "k")
-    c.capture_and_ask()
-    assert overlay.error and "pantalla negra" in overlay.body and not gemini.requests
+    e = Env(qapp, grab=boom)
+    e.tap()
+    assert e.icon.error and not e.gemini.requests and "pantalla negra" in e.c.last.text
+
+
+def test_reset_hides_everything(env):
+    env.tap()
+    env.c.reset()
+    assert env.c.state == IDLE and not env.icon.shown
+    env.last()["done"](None)
+    env.qapp.processEvents()
+    assert not env.band.shown

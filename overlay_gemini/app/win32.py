@@ -77,6 +77,26 @@ def apply_overlay_styles(hwnd: int) -> bool:
         return False
 
 
+BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+
+
+def set_low_priority() -> bool:
+    """Prioridad 'por debajo de lo normal': si la CPU va justa, OBS siempre gana."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k.SetPriorityClass.restype = wintypes.BOOL
+        return bool(k.SetPriorityClass(k.GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS))
+    except Exception:
+        return False
+
+
 def bring_topmost(hwnd: int) -> bool:
     """Reafirma 'siempre encima' sin activar la ventana (no quita el foco a nadie)."""
     if not IS_WINDOWS or not hwnd:

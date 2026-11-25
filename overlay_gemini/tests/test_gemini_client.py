@@ -160,6 +160,65 @@ def test_stream_through_real_sdk(monkeypatch):
     assert body["generation_config"] == {"thinking_level": "low"}
 
 
+def test_default_client_has_short_retries():
+    from app.gemini_client import HTTP_OPTIONS, _default_client_factory
+
+    assert HTTP_OPTIONS["retry_options"]["attempts"] == 2
+    client = _default_client_factory("clave")
+    assert client._api_client._http_options.retry_options.attempts == 2
+
+
+def test_service_start_builds_request_in_thread_and_reports_timing():
+    from app.gemini_client import Timing
+
+    seen = {}
+
+    class Client:
+        class interactions:  # noqa: N801
+            @staticmethod
+            def create(**kw):
+                seen.update(kw)
+                return [NS(event_type="step.delta", delta=NS(type="text", text="hola"))]
+
+    svc = GeminiService(lambda key: Client())
+    done = threading.Event()
+    timings = []
+    builder_thread = []
+
+    def build():
+        builder_thread.append(threading.current_thread().name)
+        return {"model": "m", "input": "x"}
+
+    t = svc.start("k", build, on_piece=lambda p: None,
+                  on_done=lambda timing: (timings.append(timing), done.set()), on_error=lambda m: done.set())
+    t.join(5)
+    assert builder_thread == ["gemini-request"]  # la imagen se codifica fuera de la interfaz
+    assert seen["model"] == "m" and seen["timeout"] > 0
+    assert isinstance(timings[0], Timing) and timings[0].first_text is not None
+
+
+def test_measure_and_warm_up():
+    class Client:
+        class interactions:  # noqa: N801
+            @staticmethod
+            def create(**kw):
+                return [NS(event_type="step.delta", delta=NS(type="text", text="uno ")),
+                        NS(event_type="step.delta", delta=NS(type="text", text="dos"))]
+
+        class models:  # noqa: N801
+            @staticmethod
+            def get(model):
+                if model == "malo":
+                    raise _E(404)
+
+    svc = GeminiService(lambda key: Client())
+    text, timing, cites = svc.measure("k", {"model": "m"})
+    assert text == "uno dos" and timing.total >= 0 and cites == []
+    assert svc.warm_up("k", "gemini-4-hydrogen") == ""
+    assert "404" in svc.warm_up("k", "malo")
+    assert svc.warm_up("", "x") == "Falta la API key."
+
+
 def test_service_start_reports_errors_via_callback():
     class Boom:
         class interactions:  # noqa: N801

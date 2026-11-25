@@ -1,8 +1,11 @@
 """Botones del ratón (X1, X2, central) y teclas globales con pynput.
 
+Los hooks globales SOLO se instalan cuando hacen falta (botón asignado de ratón o
+teclado, o mientras se asigna un botón). Con el mando no hay ningún hook, así que
+el ratón y el teclado del sistema no pasan nunca por esta app.
+
 En Windows el botón/tecla asignado se SUPRIME: no llega a ninguna otra
-aplicación. Así X1 no hace "Atrás" en el navegador del curso ni la tecla
-escribe nada en OBS.
+aplicación. Así X1 no hace "Atrás" en el navegador ni la tecla llega a OBS.
 """
 
 from __future__ import annotations
@@ -62,14 +65,18 @@ class MouseKeyboardListener:
         ev = decode_mouse_msg(msg, int(getattr(data, "mouseData", 0)))
         if ev is not None and self._wanted(ev):
             self._emit(ev)
-            self._mouse.suppress_event()  # lanza excepción: debe ser lo último
+            listener = self._mouse
+            if listener is not None:
+                listener.suppress_event()  # lanza excepción: debe ser lo último
         return True
 
     def _win_key_filter(self, msg, data):
         ev = decode_key_msg(msg, int(getattr(data, "vkCode", 0)))
         if ev is not None and self._wanted(ev):
             self._emit(ev)
-            self._keyboard.suppress_event()
+            listener = self._keyboard
+            if listener is not None:
+                listener.suppress_event()
         return True
 
     # ---------------------------------------------------------------- otros SO (sin supresión)
@@ -102,12 +109,18 @@ class MouseKeyboardListener:
                 self._emit(ev)
 
     # ---------------------------------------------------------------- ciclo de vida
+    @property
+    def running(self) -> bool:
+        return self._mouse is not None or self._keyboard is not None
+
     def start(self) -> list[str]:
+        if self.running:
+            return []
         errors: list[str] = []
         try:
             from pynput import keyboard, mouse
         except Exception as e:  # noqa: BLE001
-            return [f"pynput no disponible: {e}"]
+            return [f"Ratón/teclado no disponibles: {e}"]
         try:
             if IS_WINDOWS:
                 self._mouse = mouse.Listener(win32_event_filter=self._win_mouse_filter)
@@ -115,6 +128,7 @@ class MouseKeyboardListener:
                 self._mouse = mouse.Listener(on_click=self._on_click)
             self._mouse.start()
         except Exception as e:  # noqa: BLE001
+            self._mouse = None
             errors.append(f"Ratón: {e}")
         try:
             if IS_WINDOWS:
@@ -123,6 +137,7 @@ class MouseKeyboardListener:
                 self._keyboard = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
             self._keyboard.start()
         except Exception as e:  # noqa: BLE001
+            self._keyboard = None
             errors.append(f"Teclado: {e}")
         return errors
 
@@ -133,3 +148,4 @@ class MouseKeyboardListener:
                     listener.stop()
             except Exception:
                 pass
+        self._mouse = self._keyboard = None

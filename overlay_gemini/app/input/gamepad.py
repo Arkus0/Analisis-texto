@@ -16,7 +16,7 @@ from .bindings import InputEvent, gamepad_label
 
 TRIGGER_PRESS = 16000
 TRIGGER_RELEASE = 8000
-POLL_S = 0.008
+POLL_S = 0.010  # 100 Hz: de sobra para un botón y casi sin CPU
 
 
 class GamepadListener:
@@ -27,6 +27,8 @@ class GamepadListener:
         self._ready = threading.Event()
         self.error: str | None = None
         self.connected: dict[int, str] = {}  # instance id -> nombre
+        # Solo se abren mandos/joysticks (HID). Nunca cámaras ni capturadoras como
+        # la Cam Link: SDL no toca dispositivos de vídeo.
 
     def start(self) -> str | None:
         self._thread = threading.Thread(target=self._run, name="sdl-gamepad", daemon=True)
@@ -47,7 +49,8 @@ class GamepadListener:
             self._ready.set()
             return
 
-        sdl2.SDL_SetHint(b"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", b"1")
+        sdl2.SDL_SetHint(b"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", b"1")  # leer sin foco
+        sdl2.SDL_SetHint(b"SDL_TIMER_RESOLUTION", b"0")  # no tocar el temporizador del sistema
         if sdl2.SDL_Init(sdl2.SDL_INIT_GAMECONTROLLER | sdl2.SDL_INIT_JOYSTICK) != 0:
             self.error = "No se pudo iniciar SDL: " + (sdl2.SDL_GetError() or b"").decode(errors="replace")
             self._ready.set()
