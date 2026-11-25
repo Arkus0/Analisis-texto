@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import autostart
 from .capture import describe_screen, find_screen, grab_image, prepare_image
 from .config import Preset, Settings, api_key_from_env, get_api_key, new_id, set_api_key
 from .gemini_client import GeminiService, build_request, friendly_error
@@ -241,6 +242,17 @@ class SettingsWindow(QDialog):
             warn.setWordWrap(True)
             warn.setStyleSheet("color: #c0392b")
             f.addRow("", warn)
+        v.addWidget(g)
+
+        g = QGroupBox("Inicio")
+        f = QFormLayout(g)
+        self.autostart = QCheckBox("Arrancar con Windows (directamente en la bandeja, sin ventanas)")
+        self._autostart_initial = autostart.is_enabled()
+        self.autostart.setChecked(self._autostart_initial)
+        if not autostart.supported():
+            self.autostart.setEnabled(False)
+            self.autostart.setToolTip("Solo disponible en Windows.")
+        f.addRow(self.autostart)
         v.addWidget(g)
         v.addStretch(1)
         return w
@@ -722,6 +734,15 @@ class SettingsWindow(QDialog):
                 set_api_key(key)
             except Exception as e:  # noqa: BLE001
                 QMessageBox.critical(self, "API key", f"No se pudo guardar la API key: {e}")
+                return False
+        wanted = self.autostart.isChecked()
+        if autostart.supported() and wanted != self._autostart_initial:
+            try:
+                autostart.set_enabled(wanted)
+                self._autostart_initial = wanted
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, "Arrancar con Windows",
+                                     f"No se pudo cambiar el arranque automático: {e}")
                 return False
         self.saved.emit(copy.deepcopy(s), key or "")
         return True

@@ -3,6 +3,7 @@
 Uso:
     python main.py              # arranca en la bandeja del sistema
     python main.py --settings   # abre Ajustes al arrancar
+    python main.py --autostart  # como lo lanza Windows al iniciar sesión (solo bandeja)
     python main.py --selftest selftest.log   # comprobación sin interfaz (CI / .exe)
 
 Diseñada para convivir con OBS: proceso aparte y de prioridad baja, sin GPU, sin
@@ -34,6 +35,7 @@ IMPACT_TOTAL_S = 180  # prueba de impacto: 3 minutos
 IMPACT_CYCLE_S = 10  # una "pulsación" cada 10 s
 IMPACT_HIDE_AT_S = 6  # y se oculta a los 6 s
 SIM_DELAY_S = 2.0  # "respuesta" simulada a los 2 s
+KEEPALIVE_S = 150  # mantener la conexión con Gemini abierta (sin gastar tokens)
 
 
 def setup_logging() -> None:
@@ -114,13 +116,13 @@ class SimulatedGemini:
 class App(QObject):
     warm_result = Signal(str)
 
-    def __init__(self, open_settings: bool = False):
+    def __init__(self, open_settings: bool = False, from_autostart: bool = False):
         super().__init__()
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction
         from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-        from app import win32
+        from app import autostart, win32
         from app.capture import grab_image, prepare_image
         from app.config import get_api_key, load_settings
         from app.controller import Controller
@@ -195,11 +197,30 @@ class App(QObject):
 
         self.warm_result.connect(self._on_warm_result)
         self.warm_up()
+        # Conexión siempre preparada: cada 150 s, si no ha habido tráfico, una petición
+        # de metadatos (no gasta tokens) para que la siguiente pulsación no pague el TLS.
+        self._keepalive = QTimer(self)
+        self._keepalive.setInterval(KEEPALIVE_S * 1000)
+        self._keepalive.timeout.connect(self._keepalive_tick)
+        self._keepalive.start()
         self._refresh_info()
-        log.info("Arrancado · prioridad baja: %s · captura excluida: %s · hooks: %s",
-                 self.low_priority, self.band.capture_excluded, self.hub.mouse_kb.running)
 
-        if open_settings or not get_api_key() or self.settings.capture_binding is None:
+        if getattr(sys, "frozen", False):
+            try:
+                if autostart.refresh_path():
+                    log.info("Arranque con Windows: ruta del .exe actualizada")
+            except Exception as e:  # noqa: BLE001
+                log.warning("Arranque con Windows: %s", e)
+
+        log.info("Arrancado%s · prioridad baja: %s · captura excluida: %s · hooks: %s",
+                 " (con Windows)" if from_autostart else "", self.low_priority,
+                 self.band.capture_excluded, self.hub.mouse_kb.running)
+
+        needs_setup = not get_api_key() or self.settings.capture_binding is None
+        if from_autostart:
+            if needs_setup:
+                log.info("Falta configuración: abre Ajustes desde la bandeja cuando quieras")
+        elif open_settings or needs_setup:
             QTimer.singleShot(300, self.open_settings)
 
     # ----------------------------------------------------------------- conexión
@@ -215,9 +236,20 @@ class App(QObject):
         threading.Thread(target=lambda: self.warm_result.emit(self.gemini.warm_up(key, model)),
                          name="warm-up", daemon=True).start()
 
+    def _keepalive_tick(self) -> None:
+        from app.config import get_api_key
+
+        if self._impact_timer.isActive() or not get_api_key():
+            return
+        if time.monotonic() - self.gemini.last_activity < KEEPALIVE_S - 5:
+            return  # ha habido tráfico hace poco: la conexión sigue abierta
+        self.warm_up()
+
     def _on_warm_result(self, error: str) -> None:
-        self.api_status = f"✖ {error}" if error else "✔ Clave válida y conexión preparada"
-        log.info("Conexión con Gemini: %s", self.api_status)
+        status = f"✖ {error}" if error else "✔ Clave válida y conexión preparada"
+        if status != self.api_status:  # el log solo apunta los cambios
+            log.info("Conexión con Gemini: %s", status)
+        self.api_status = status
         self._refresh_info()
 
     # ----------------------------------------------------------------- bandeja
@@ -480,6 +512,8 @@ def selftest(log_path: str | None) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Overlay Gemini")
     parser.add_argument("--settings", action="store_true", help="abrir Ajustes al arrancar")
+    parser.add_argument("--autostart", action="store_true",
+                        help="arranque con Windows: solo bandeja, nunca abre ventanas")
     parser.add_argument("--selftest", nargs="?", const="", metavar="LOG",
                         help="comprobar dependencias y salir")
     args = parser.parse_args(argv)
@@ -500,7 +534,7 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Ya había una instancia abierta: se sale en silencio")
         return 0
 
-    app = App(open_settings=args.settings)  # noqa: F841 - mantiene vivos los objetos
+    app = App(open_settings=args.settings, from_autostart=args.autostart)  # noqa: F841 - mantiene vivos los objetos
     return qapp.exec()
 
 
